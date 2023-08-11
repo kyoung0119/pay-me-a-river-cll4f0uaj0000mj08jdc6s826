@@ -1,7 +1,12 @@
 module overmind::pay_me_a_river {
-    use aptos_std::table::Table;
+    use aptos_std::table::{Self, Table};
     use aptos_framework::aptos_coin::AptosCoin;
-    use aptos_framework::coin::Coin;
+    use aptos_framework::coin::{Self, Coin};
+
+    use std::signer;
+    use std::bcs;
+    use aptos_framework::account;
+    use aptos_framework::timestamp;
 
     const ESENDER_CAN_NOT_BE_RECEIVER: u64 = 1;
     const ENUMBER_INVALID: u64 = 2;
@@ -20,43 +25,150 @@ module overmind::pay_me_a_river {
 
     struct Payments has key {
         streams: Table<address, Stream>,
+        resource_signer_cap: account::SignerCapability,
     }
 
-    inline fun check_sender_is_not_receiver(sender: address, receiver: address) {}
+    inline fun check_sender_is_not_receiver(sender: address, receiver: address) {
+        assert!(sender != receiver, ESENDER_CAN_NOT_BE_RECEIVER)
+    }
 
-    inline fun check_number_is_valid(number: u64) {}
+    inline fun check_number_is_valid(number: u64) {
+        assert!(number > 0, ENUMBER_INVALID)
+    }
 
-    inline fun check_payment_exists(sender_address: address) {}
+    inline fun check_payment_exists(sender_address: address) {
+        assert!(exists<Payments>(sender_address), EPAYMENT_DOES_NOT_EXIST)
+    }
 
-    inline fun check_stream_exists(payments: &Payments, stream_address: address) {}
+    inline fun check_stream_exists(payments: &Payments, stream_address: address) {
+        assert!(table::contains(&payments.streams, stream_address), ESTREAM_DOES_NOT_EXIST)
+    }
 
-    inline fun check_stream_is_not_active(payments: &Payments, stream_address: address) {}
+    inline fun check_stream_is_not_active(payments: &Payments, stream_address: address) {
+        let stream = table::borrow(&payments.streams, stream_address);
+        assert!(stream.start_time == 0, ESTREAM_IS_ACTIVE); 
+    }
 
     inline fun check_signer_address_is_sender_or_receiver(
         signer_address: address,
         sender_address: address,
         receiver_address: address
-    ) {}
+    ) {
+        assert!(signer_address == sender_address || signer_address == receiver_address, ESIGNER_ADDRESS_IS_NOT_SENDER_OR_RECEIVER)
+    }
 
-    inline fun calculate_stream_claim_amount(total_amount: u64, start_time: u64, length_in_seconds: u64): u64 {}
+    inline fun calculate_stream_claim_amount(total_amount: u64, start_time: u64, length_in_seconds: u64): u64 {
+        let now = timestamp::now_seconds();
+        let end_time = start_time + length_in_seconds;
+        let elapsed_time = now - start_time;
+        if (now > end_time) {
+            length_in_seconds
+        } else {
+            (total_amount * elapsed_time) / total_amount
+        }
+    }
 
     public entry fun create_stream(
         signer: &signer,
         receiver_address: address,
         amount: u64,
         length_in_seconds: u64
-    ) acquires Payments {}
+    ) acquires Payments {
+        let payment_addr = signer::address_of(signer);
+        
+        if (!exists<Payments>(payment_addr)) {
+            let streams = table::new<address, Stream>();
+            let seed = bcs::to_bytes(&receiver_address);
+            let (_, resource_signer_cap) = account::create_resource_account(signer, seed);
 
-    public entry fun accept_stream(signer: &signer, sender_address: address) acquires Payments {}
+            move_to(signer, Payments {streams, resource_signer_cap});
+        };
+        let payments = borrow_global_mut<Payments>(payment_addr);
 
-    public entry fun claim_stream(signer: &signer, sender_address: address) acquires Payments {}
+        let resource_signer = account::create_signer_with_capability(&payments.resource_signer_cap);
+        let resource_address = signer::address_of(&resource_signer);
+
+        coin::register<AptosCoin>(&resource_signer);
+        if (!table::contains(&mut payments.streams, receiver_address)) {
+            let coins = coin::zero<AptosCoin>();
+            let stream = Stream {
+                sender: payment_addr,
+                receiver: receiver_address,
+                length_in_seconds,
+                start_time: timestamp::now_seconds(),
+                coins
+            };
+            table::add(&mut payments.streams, receiver_address, stream);
+        } else {
+            let stream = table::borrow_mut(&mut payments.streams, receiver_address);
+            stream.length_in_seconds = length_in_seconds;
+            stream.start_time = timestamp::now_seconds();
+        };
+
+        coin::transfer<AptosCoin>(signer, resource_address, amount)
+    }
+
+    public entry fun accept_stream(signer: &signer, sender_address: address) acquires Payments {
+        check_payment_exists(sender_address);
+        let payments = borrow_global_mut<Payments>(sender_address);
+        let receiver_addr = signer::address_of(signer);
+
+        check_stream_exists(payments, receiver_addr);
+        check_stream_is_not_active(payments, receiver_addr);
+        check_sender_is_not_receiver(sender_address, receiver_addr);
+
+        let stream = table::borrow_mut(&mut payments.streams, receiver_addr);
+        stream.start_time = timestamp::now_seconds();
+    }
+
+    public entry fun claim_stream(signer: &signer, sender_address: address) acquires Payments {
+        check_payment_exists(sender_address);
+        let payments = borrow_global_mut<Payments>(sender_address);
+        let receiver_addr = signer::address_of(signer);
+        check_stream_exists(payments, receiver_addr);
+        check_sender_is_not_receiver(sender_address, receiver_addr);
+
+        let resource_signer = account::create_signer_with_capability(&payments.resource_signer_cap);
+        let resource_address = signer::address_of(&resource_signer);
+        let stream = table::borrow_mut(&mut payments.streams, receiver_addr);
+
+        let claim_amount = calculate_stream_claim_amount(coin::balance<AptosCoin>(resource_address),
+            stream.start_time, stream.length_in_seconds);
+
+        coin::transfer<AptosCoin>(&resource_signer, stream.receiver, claim_amount);
+    }
 
     public entry fun cancel_stream(
         signer: &signer,
         sender_address: address,
         receiver_address: address
-    ) acquires Payments {}
+    ) acquires Payments {
+        check_payment_exists(sender_address);
+        let payments = borrow_global<Payments>(sender_address);
+        check_stream_exists(payments, receiver_address);
+        check_stream_is_not_active(payments, receiver_address);
+        check_signer_address_is_sender_or_receiver(signer::address_of(signer), sender_address, receiver_address);
+
+        let payments = borrow_global_mut<Payments>(sender_address);
+        let resource_signer = account::create_signer_with_capability(&payments.resource_signer_cap);
+        let resource_address = signer::address_of(&resource_signer);
+        let stream = table::borrow_mut(&mut payments.streams, receiver_address);
+        stream.start_time = 0;
+        
+        let amount = coin::balance<AptosCoin>(resource_address);
+        coin::transfer<AptosCoin>(&resource_signer, sender_address, amount);
+    }
 
     #[view]
-    public fun get_stream(sender_address: address, receiver_address: address): (u64, u64, u64) acquires Payments {}
+    public fun get_stream(sender_address: address, receiver_address: address): (u64, u64, u64) acquires Payments {
+        check_payment_exists(sender_address);
+        let payments = borrow_global_mut<Payments>(sender_address);
+        check_stream_exists(payments, receiver_address);
+        let resource_signer = account::create_signer_with_capability(&payments.resource_signer_cap);
+        let resource_address = signer::address_of(&resource_signer);
+        let stream = table::borrow_mut(&mut payments.streams, receiver_address);
+        let balance = coin::balance<AptosCoin>(resource_address);
+        // debug::print(&balance);
+        (stream.length_in_seconds, stream.start_time, balance)
+    }
 }
